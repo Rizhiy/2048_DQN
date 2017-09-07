@@ -1,258 +1,125 @@
-import gym
-import math
-import random
+# http://kvfrans.com/simple-algoritms-for-solving-cartpole/
 import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-from collections import namedtuple
-from itertools import count
-from copy import deepcopy
-from PIL import Image
-
-import torch
+import random
+import gym
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.autograd import Variable
-import torchvision.transforms as T
+import torch.functional as F
 
-env = gym.make('CartPole-v0').unwrapped
-
-# set up matplotlib
-is_ipython = 'inline' in matplotlib.get_backend()
-if is_ipython:
-    from IPython import display
-
-plt.ion()
-
-# if gpu is to be used
-use_cuda = torch.cuda.is_available()
-FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
-LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
-ByteTensor = torch.cuda.ByteTensor if use_cuda else torch.ByteTensor
-Tensor = FloatTensor
-
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
+class Policy(nn.Module):
+    def __int__(self):
+        nn.Module.__init__(self)
 
 
-class ReplayMemory(object):
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
 
-    def push(self, *args):
-        """Saves a transition."""
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-
-    def __len__(self):
-        return len(self.memory)
+def policy_gradient():
+    params = tf.get_variable("policy_parameters", [4, 2])
+    state = tf.placeholder("float", [None, 4])
+    actions = tf.placeholder("float", [None, 2])
+    advantages = tf.placeholder("float", [None, 1])
+    linear = tf.matmul(state, params)
+    probabilities = tf.nn.softmax(linear)
+    good_probabilities = tf.reduce_sum(tf.mul(probabilities, actions), reduction_indices=[1])
+    eligibility = tf.log(good_probabilities) * advantages
+    loss = -tf.reduce_sum(eligibility)
+    optimizer = tf.train.AdamOptimizer(0.01).minimize(loss)
+    return probabilities, state, actions, advantages, optimizer
 
 
-class DQN(nn.Module):
-    def __init__(self):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(4, 8)
-        # self.bn1 = nn.BatchNorm1d(16)
-        self.fc2 = nn.Linear(8, 16)
-        # self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(16, 32)
-        # self.bn3 = nn.BatchNorm1d(32)
-        self.head = nn.Linear(32, 2)
-
-    def forward(self, x):
-        x = x.view(-1, 4)
-        # x = F.relu(self.bn1(self.fc1(x)))
-        # x = F.relu(self.bn2(self.fc2(x)))
-        # x = F.relu(self.bn3(self.fc3(x)))
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        return F.softmax(self.head(x))
+def value_gradient():
+    with tf.variable_scope("value"):
+        state = tf.placeholder("float", [None, 4])
+        newvals = tf.placeholder("float", [None, 1])
+        w1 = tf.get_variable("w1", [4, 10])
+        b1 = tf.get_variable("b1", [10])
+        h1 = tf.nn.relu(tf.matmul(state, w1) + b1)
+        w2 = tf.get_variable("w2", [10, 1])
+        b2 = tf.get_variable("b2", [1])
+        calculated = tf.matmul(h1, w2) + b2
+        diffs = calculated - newvals
+        loss = tf.nn.l2_loss(diffs)
+        optimizer = tf.train.AdamOptimizer(0.1).minimize(loss)
+        return calculated, state, newvals, optimizer, loss
 
 
-resize = T.Compose([T.ToPILImage(),
-                    T.Scale(40, interpolation=Image.CUBIC),
-                    T.ToTensor()])
+def run_episode(env, policy_grad, value_grad, sess):
+    pl_calculated, pl_state, pl_actions, pl_advantages, pl_optimizer = policy_grad
+    vl_calculated, vl_state, vl_newvals, vl_optimizer, vl_loss = value_grad
+    observation = env.reset()
+    totalreward = 0
+    states = []
+    actions = []
+    advantages = []
+    transitions = []
+    update_vals = []
 
-# This is based on the code from gym.
-screen_width = 600
+    for _ in xrange(200):
+        # calculate policy
+        obs_vector = np.expand_dims(observation, axis=0)
+        probs = sess.run(pl_calculated, feed_dict={pl_state: obs_vector})
+        action = 0 if random.uniform(0, 1) < probs[0][0] else 1
+        # record the transition
+        states.append(observation)
+        actionblank = np.zeros(2)
+        actionblank[action] = 1
+        actions.append(actionblank)
+        # take the action in the environment
+        old_observation = observation
+        observation, reward, done, info = env.step(action)
+        transitions.append((old_observation, action, reward))
+        totalreward += reward
 
-
-def get_cart_location():
-    world_width = env.x_threshold * 2
-    scale = screen_width / world_width
-    return int(env.state[0] * scale + screen_width / 2.0)  # MIDDLE OF CART
-
-
-def get_screen():
-    screen = env.render(mode='rgb_array').transpose(
-        (2, 0, 1))  # transpose into torch order (CHW)
-    # Strip off the top and bottom of the screen
-    screen = screen[:, 160:320]
-    view_width = 320
-    cart_location = get_cart_location()
-    if cart_location < view_width // 2:
-        slice_range = slice(view_width)
-    elif cart_location > (screen_width - view_width // 2):
-        slice_range = slice(-view_width, None)
-    else:
-        slice_range = slice(cart_location - view_width // 2,
-                            cart_location + view_width // 2)
-    # Strip off the edges, so that we have a square image centered on a cart
-    screen = screen[:, :, slice_range]
-    # Convert to float, rescare, convert to torch tensor
-    # (this doesn't require a copy)
-    screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
-    screen = torch.from_numpy(screen)
-    # Resize, and add a batch dimension (BCHW)
-    return resize(screen).unsqueeze(0).type(Tensor)
-
-
-env.reset()
-
-BATCH_SIZE = 128
-GAMMA = 0.999
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 200
-
-model = DQN()
-
-if use_cuda:
-    model.cuda()
-
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-memory = ReplayMemory(100000)
-
-steps_done = 0
-
-
-def select_action(state):
-    global steps_done
-    sample = random.random()
-    eps_threshold = EPS_END + (EPS_START - EPS_END) * \
-                              math.exp(-1. * steps_done / EPS_DECAY)
-    steps_done += 1
-    if sample > eps_threshold:
-        return model(
-            Variable(state, volatile=True).type(FloatTensor)).data.max(1)[1].view(1, 1)
-    else:
-        return LongTensor([[random.randrange(2)]])
-
-
-episode_durations = []
-
-last_sync = 0
-
-
-def optimize_model():
-    global last_sync
-    if len(memory) < BATCH_SIZE:
-        return
-    transitions = memory.sample(BATCH_SIZE)
-    # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
-    # detailed explanation).
-    batch = Transition(*zip(*transitions))
-
-    # Compute a mask of non-final states and concatenate the batch elements
-    non_final_mask = ByteTensor(tuple(map(lambda s: s is not None,
-                                          batch.next_state)))
-
-    # We don't want to backprop through the expected action values and volatile
-    # will save us on temporarily changing the model parameters'
-    # requires_grad to False!
-    non_final_next_states = Variable(torch.cat([s for s in batch.next_state
-                                                if s is not None]),
-                                     volatile=True)
-    state_batch = Variable(torch.cat(batch.state))
-    action_batch = Variable(torch.cat(batch.action))
-    reward_batch = Variable(torch.cat(batch.reward))
-
-    # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
-    # columns of actions taken
-    state_action_values = model(state_batch).gather(1, action_batch)
-
-    # Compute V(s_{t+1}) for all next states.
-    next_state_values = Variable(torch.zeros(BATCH_SIZE).type(Tensor))
-    next_state_values[non_final_mask] = model(non_final_next_states).max(1)[0]
-    # Now, we don't want to mess up the loss with a volatile flag, so let's
-    # clear it. After this, we'll just end up with a Variable that has
-    # requires_grad=False
-    next_state_values.volatile = False
-    # Compute the expected Q values
-    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
-    # Compute Huber loss
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
-
-    # Optimize the model
-    optimizer.zero_grad()
-    loss.backward()
-    for param in model.parameters():
-        param.grad.data.clamp_(-1, 1)
-    optimizer.step()
-
-
-def plot_durations():
-    plt.figure(2)
-    plt.clf()
-    durations_t = torch.FloatTensor(episode_durations)
-    plt.title('Training...')
-    plt.xlabel('Episode')
-    plt.ylabel('Duration')
-    plt.plot(durations_t.numpy())
-    # Take 100 episode averages and plot them too
-    if len(durations_t) >= 100:
-        means = durations_t.unfold(0, 100, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(99), means))
-        plt.plot(means.numpy())
-
-    plt.pause(0.001)  # pause a bit so that plots are updated
-    if is_ipython:
-        display.clear_output(wait=True)
-        display.display(plt.gcf())
-
-
-num_episodes = 1000
-for i_episode in range(num_episodes):
-    # Initialize the environment and state
-    env.reset()
-    state = Tensor(env.state)
-    for t in count():
-        # Select and perform an action
-        action = select_action(state)
-        _, reward, done, _ = env.step(action[0, 0])
-        reward = Tensor([reward])
-
-        # Observe new state
-        if not done:
-            next_state = Tensor(env.state)
-        else:
-            next_state = None
-
-        # Store the transition in memory
-        memory.push(state, action, next_state, reward)
-
-        # Move to the next state
-        state = next_state
-
-        # Perform one step of the optimization (on the target network)
-        optimize_model()
         if done:
-            episode_durations.append(t + 1)
-            plot_durations()
             break
+    for index, trans in enumerate(transitions):
+        obs, action, reward = trans
 
-print('Complete')
-env.render(close=True)
-env.close()
-plt.ioff()
-plt.show()
+        # calculate discounted monte-carlo return
+        future_reward = 0
+        future_transitions = len(transitions) - index
+        decrease = 1
+        for index2 in xrange(future_transitions):
+            future_reward += transitions[(index2) + index][2] * decrease
+            decrease = decrease * 0.97
+        obs_vector = np.expand_dims(obs, axis=0)
+        currentval = sess.run(vl_calculated, feed_dict={vl_state: obs_vector})[0][0]
+
+        # advantage: how much better was this action than normal
+        advantages.append(future_reward - currentval)
+
+        # update the value function towards new return
+        update_vals.append(future_reward)
+
+    # update value function
+    update_vals_vector = np.expand_dims(update_vals, axis=1)
+    sess.run(vl_optimizer, feed_dict={vl_state: states, vl_newvals: update_vals_vector})
+    # real_vl_loss = sess.run(vl_loss, feed_dict={vl_state: states, vl_newvals: update_vals_vector})
+
+    advantages_vector = np.expand_dims(advantages, axis=1)
+    sess.run(pl_optimizer,
+             feed_dict={pl_state: states, pl_advantages: advantages_vector, pl_actions: actions})
+
+    return totalreward
+
+
+env = gym.make('CartPole-v0')
+env.monitor.start('cartpole-hill/', force=True)
+policy_grad = policy_gradient()
+value_grad = value_gradient()
+sess = tf.InteractiveSession()
+sess.run(tf.initialize_all_variables())
+for i in xrange(2000):
+    reward = run_episode(env, policy_grad, value_grad, sess)
+    if reward == 200:
+        print
+        "reward 200"
+        print
+        i
+        break
+t = 0
+for _ in xrange(1000):
+    reward = run_episode(env, policy_grad, value_grad, sess)
+    t += reward
+print
+t / 1000
+env.monitor.close()
